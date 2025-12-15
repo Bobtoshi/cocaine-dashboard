@@ -16,14 +16,16 @@ const WALLET_RPC = 'http://127.0.0.1:19083/json_rpc';
 const WALLET_DIR = path.join(os.homedir(), '.cocaine', 'wallets');
 const COCAINE_DIR = path.join(os.homedir(), '.cocaine');
 
-// Find wallet-rpc binary
-function findWalletRpc() {
+// Find binaries
+function findBinary(name) {
     const possiblePaths = [
-        path.join(__dirname, '..', 'build', 'bin', 'cocaine-wallet-rpc'),
-        path.join(__dirname, 'cocaine-wallet-rpc'),
-        path.join(COCAINE_DIR, 'cocaine-wallet-rpc'),
-        '/usr/local/bin/cocaine-wallet-rpc',
-        'cocaine-wallet-rpc'
+        path.join(__dirname, '..', 'cocaine', 'build', 'bin', name),  // ../cocaine/build/bin/
+        path.join(__dirname, '..', 'build', 'bin', name),              // ../build/bin/
+        path.join(__dirname, name),                                     // same dir as dashboard
+        path.join(COCAINE_DIR, name),                                   // ~/.cocaine/
+        path.join(os.homedir(), 'Desktop', 'cocaine', 'build', 'bin', name), // ~/Desktop/cocaine/build/bin/
+        `/usr/local/bin/${name}`,
+        name
     ];
     for (const p of possiblePaths) {
         if (fs.existsSync(p)) return p;
@@ -32,7 +34,12 @@ function findWalletRpc() {
 }
 
 let walletRpcProcess = null;
-let walletRpcBinary = findWalletRpc();
+let daemonProcess = null;
+let walletRpcBinary = findBinary('cocaine-wallet-rpc');
+let daemonBinary = findBinary('cocained');
+
+// Data directory for daemon
+const DATA_DIR = path.join(os.homedir(), '.cocaine');
 
 // Start wallet-rpc if not running
 async function ensureWalletRpc() {
@@ -151,6 +158,82 @@ app.get('/api/daemon/status', async (req, res) => {
         });
     } catch (error) {
         res.json({ running: false, error: error.message });
+    }
+});
+
+// Start daemon
+app.post('/api/daemon/start', async (req, res) => {
+    // Check if already running
+    try {
+        const check = await fetch(`${DAEMON_HTTP}/get_info`, { timeout: 2000 });
+        if (check.ok) {
+            return res.json({ success: true, message: 'Daemon already running' });
+        }
+    } catch (e) {}
+
+    if (!daemonBinary) {
+        return res.status(500).json({ success: false, error: 'cocained binary not found' });
+    }
+
+    try {
+        console.log('[*] Starting daemon...');
+        const logFile = path.join(DATA_DIR, 'cocained.log');
+
+        daemonProcess = spawn(daemonBinary, [
+            '--data-dir', DATA_DIR,
+            '--p2p-bind-port', '19080',
+            '--rpc-bind-ip', '127.0.0.1',
+            '--rpc-bind-port', '19081',
+            '--add-peer', '138.68.128.104:19080',
+            '--non-interactive',
+            '--log-file', logFile,
+            '--log-level', '1'
+        ], { detached: true, stdio: 'ignore' });
+
+        daemonProcess.unref();
+
+        // Wait for it to start
+        await new Promise(r => setTimeout(r, 3000));
+
+        // Verify it started
+        try {
+            const verify = await fetch(`${DAEMON_HTTP}/get_info`, { timeout: 2000 });
+            if (verify.ok) {
+                res.json({ success: true, message: 'Daemon started' });
+            } else {
+                res.json({ success: false, error: 'Daemon failed to start' });
+            }
+        } catch (e) {
+            res.json({ success: false, error: 'Daemon failed to respond' });
+        }
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Stop daemon
+app.post('/api/daemon/stop', async (req, res) => {
+    try {
+        // Try graceful shutdown via RPC first
+        try {
+            await fetch(`${DAEMON_HTTP}/stop_daemon`, { timeout: 5000 });
+        } catch (e) {}
+
+        // Also try to kill the process
+        try {
+            if (process.platform === 'win32') {
+                execSync('taskkill /F /IM cocained.exe', { stdio: 'ignore' });
+            } else {
+                execSync('pkill -9 cocained', { stdio: 'ignore' });
+            }
+        } catch (e) {}
+
+        // Wait a moment
+        await new Promise(r => setTimeout(r, 1000));
+
+        res.json({ success: true, message: 'Daemon stopped' });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
