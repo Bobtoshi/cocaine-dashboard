@@ -2,28 +2,25 @@ const express = require('express');
 const fetch = require('node-fetch');
 const open = require('open');
 const path = require('path');
-const { spawn } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 
 const app = express();
 const PORT = 8080;
-const CONTROLLER_URL = 'http://127.0.0.1:8787';
 const DAEMON_RPC = 'http://127.0.0.1:19081/json_rpc';
 const DAEMON_HTTP = 'http://127.0.0.1:19081';
 const WALLET_RPC = 'http://127.0.0.1:19083/json_rpc';
-const WALLET_DIR = path.join(__dirname, '..', 'wallets');
-const WALLET_RPC_BIN = path.join(__dirname, '..', 'build', 'bin', 'cocaine-wallet-rpc');
 
-let walletRpcProcess = null;
-let currentWalletName = null;
-
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+// Cross-platform wallet directory in user's home
+const WALLET_DIR = path.join(os.homedir(), '.cocaine', 'wallets');
 
 // Ensure wallet directory exists
 if (!fs.existsSync(WALLET_DIR)) {
     fs.mkdirSync(WALLET_DIR, { recursive: true });
 }
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Helper: Call wallet RPC
 async function walletRpc(method, params = {}) {
@@ -55,63 +52,11 @@ async function daemonRpc(method, params = {}) {
     return response.json();
 }
 
-// Start wallet RPC server
-function startWalletRpc() {
-    return new Promise((resolve, reject) => {
-        if (walletRpcProcess) {
-            resolve();
-            return;
-        }
-
-        console.log('[*] Starting wallet RPC server...');
-
-        walletRpcProcess = spawn(WALLET_RPC_BIN, [
-            '--daemon-address', '127.0.0.1:19081',
-            '--rpc-bind-port', '19083',
-            '--disable-rpc-login',
-            '--wallet-dir', WALLET_DIR,
-            '--log-level', '1'
-        ]);
-
-        walletRpcProcess.stdout.on('data', (data) => {
-            const msg = data.toString();
-            if (msg.includes('Starting wallet RPC server')) {
-                console.log('[+] Wallet RPC server started on port 19083');
-                setTimeout(resolve, 1000);
-            }
-        });
-
-        walletRpcProcess.stderr.on('data', (data) => {
-            console.error('[wallet-rpc]', data.toString());
-        });
-
-        walletRpcProcess.on('close', (code) => {
-            console.log('[!] Wallet RPC server exited with code', code);
-            walletRpcProcess = null;
-        });
-
-        // Timeout fallback
-        setTimeout(resolve, 3000);
-    });
-}
-
 // ==================== DAEMON ENDPOINTS ====================
 
-// ==================== CONTROLLER PROXY ENDPOINTS ====================
-
-// Proxy daemon status (uses controller)
+// Get daemon info
 app.get('/api/info', async (req, res) => {
     try {
-        // Try controller first
-        const controllerRes = await fetch(`${CONTROLLER_URL}/daemon/status`);
-        if (controllerRes.ok) {
-            const controllerData = await controllerRes.json();
-            if (controllerData.running) {
-                // Return in expected format
-                return res.json({ result: controllerData });
-            }
-        }
-        // Fallback to direct RPC
         const data = await daemonRpc('get_info');
         res.json(data);
     } catch (error) {
@@ -119,53 +64,19 @@ app.get('/api/info', async (req, res) => {
     }
 });
 
-// Start daemon (via controller)
-app.post('/api/daemon/start', async (req, res) => {
-    try {
-        const response = await fetch(`${CONTROLLER_URL}/daemon/start`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' }
-        });
-        const data = await response.json();
-        res.json(data);
-    } catch (error) {
-        res.status(500).json({ status: 'error', error: error.message });
-    }
-});
-
-// Stop daemon (via controller)
-app.post('/api/daemon/stop', async (req, res) => {
-    try {
-        const response = await fetch(`${CONTROLLER_URL}/daemon/stop`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' }
-        });
-        const data = await response.json();
-        res.json(data);
-    } catch (error) {
-        res.status(500).json({ status: 'error', error: error.message });
-    }
-});
-
-// Get daemon status (via controller)
+// Get daemon status (direct to daemon)
 app.get('/api/daemon/status', async (req, res) => {
     try {
-        const response = await fetch(`${CONTROLLER_URL}/daemon/status`);
+        const response = await fetch(`${DAEMON_HTTP}/get_info`);
         const data = await response.json();
-        res.json(data);
+        res.json({
+            running: true,
+            height: data.height,
+            synchronized: data.synchronized,
+            connections: (data.outgoing_connections_count || 0) + (data.incoming_connections_count || 0)
+        });
     } catch (error) {
-        res.status(500).json({ running: false, error: error.message });
-    }
-});
-
-// Get daemon logs
-app.get('/api/daemon/logs', async (req, res) => {
-    try {
-        const response = await fetch(`${CONTROLLER_URL}/daemon/logs?lines=${req.query.lines || 50}`);
-        const data = await response.json();
-        res.json(data);
-    } catch (error) {
-        res.status(500).json({ logs: [], error: error.message });
+        res.json({ running: false, error: error.message });
     }
 });
 
@@ -191,36 +102,14 @@ app.get('/api/block/:height', async (req, res) => {
     }
 });
 
-// Mining status (proxy to controller)
+// ==================== MINING ENDPOINTS ====================
+
+// Mining status (via daemon RPC)
 app.get('/api/mining_status', async (req, res) => {
     try {
-        // Get miner status from controller
-        const minerRes = await fetch(`${CONTROLLER_URL}/miner/status`);
-        const minerData = await minerRes.json();
-        
-        if (minerData.running) {
-            // Get difficulty from daemon
-            const daemonRes = await fetch(`${DAEMON_HTTP}/get_info`);
-            const daemonData = await daemonRes.json();
-            
-            res.json({
-                active: true,
-                address: minerData.address,
-                threads_count: minerData.threads,
-                speed: minerData.hashrate,
-                status: 'OK',
-                difficulty: daemonData.difficulty || 0,
-                block_reward: 0 // Will be calculated
-            });
-        } else {
-            res.json({
-                active: false,
-                address: '',
-                threads_count: 0,
-                speed: 0,
-                status: 'OK'
-            });
-        }
+        const response = await fetch(`${DAEMON_HTTP}/mining_status`);
+        const data = await response.json();
+        res.json(data);
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -266,12 +155,8 @@ app.get('/api/miner/status', async (req, res) => {
     }
 });
 
-// Get miner logs (not applicable for daemon mining, return empty)
-app.get('/api/miner/logs', async (req, res) => {
-    res.json({ logs: ['Mining via daemon - check daemon logs'] });
-});
-
 // ==================== WALLET ENDPOINTS ====================
+// Note: These require cocaine-wallet-rpc to be running separately on port 19083
 
 // List available wallets
 app.get('/api/wallet/list', async (req, res) => {
@@ -280,9 +165,9 @@ app.get('/api/wallet/list', async (req, res) => {
         const wallets = files
             .filter(f => f.endsWith('.keys'))
             .map(f => f.replace('.keys', ''));
-        res.json({ wallets, current: currentWalletName });
+        res.json({ wallets });
     } catch (error) {
-        res.json({ wallets: [], current: null });
+        res.json({ wallets: [] });
     }
 });
 
@@ -295,8 +180,6 @@ app.post('/api/wallet/create', async (req, res) => {
     }
 
     try {
-        await startWalletRpc();
-
         const data = await walletRpc('create_wallet', {
             filename: name,
             password: password || '',
@@ -306,8 +189,6 @@ app.post('/api/wallet/create', async (req, res) => {
         if (data.error) {
             return res.json({ success: false, error: data.error.message });
         }
-
-        currentWalletName = name;
 
         // Get the seed phrase
         const seedData = await walletRpc('query_key', { key_type: 'mnemonic' });
@@ -320,7 +201,7 @@ app.post('/api/wallet/create', async (req, res) => {
             seed: seedData.result?.key
         });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: 'Wallet RPC not running. Start cocaine-wallet-rpc first.' });
     }
 });
 
@@ -329,8 +210,6 @@ app.post('/api/wallet/open', async (req, res) => {
     const { name, password } = req.body;
 
     try {
-        await startWalletRpc();
-
         const data = await walletRpc('open_wallet', {
             filename: name,
             password: password || ''
@@ -340,7 +219,6 @@ app.post('/api/wallet/open', async (req, res) => {
             return res.json({ success: false, error: data.error.message });
         }
 
-        currentWalletName = name;
         const addressData = await walletRpc('get_address');
 
         res.json({
@@ -349,7 +227,7 @@ app.post('/api/wallet/open', async (req, res) => {
             address: addressData.result?.address
         });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: 'Wallet RPC not running. Start cocaine-wallet-rpc first.' });
     }
 });
 
@@ -362,8 +240,6 @@ app.post('/api/wallet/restore', async (req, res) => {
     }
 
     try {
-        await startWalletRpc();
-
         const data = await walletRpc('restore_deterministic_wallet', {
             filename: name,
             password: password || '',
@@ -376,8 +252,6 @@ app.post('/api/wallet/restore', async (req, res) => {
             return res.json({ success: false, error: data.error.message });
         }
 
-        currentWalletName = name;
-
         res.json({
             success: true,
             name: name,
@@ -385,7 +259,7 @@ app.post('/api/wallet/restore', async (req, res) => {
             info: data.result?.info
         });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: 'Wallet RPC not running. Start cocaine-wallet-rpc first.' });
     }
 });
 
@@ -401,7 +275,6 @@ app.get('/api/wallet/balance', async (req, res) => {
         res.json({
             balance: data.result?.balance || 0,
             unlocked_balance: data.result?.unlocked_balance || 0,
-            // Convert from atomic units (12 decimals)
             balance_display: ((data.result?.balance || 0) / 1e12).toFixed(4),
             unlocked_display: ((data.result?.unlocked_balance || 0) / 1e12).toFixed(4)
         });
@@ -457,7 +330,6 @@ app.post('/api/wallet/send', async (req, res) => {
     }
 
     try {
-        // Convert amount to atomic units
         const atomicAmount = Math.floor(parseFloat(amount) * 1e12);
 
         const params = {
@@ -488,7 +360,7 @@ app.post('/api/wallet/send', async (req, res) => {
     }
 });
 
-// Refresh wallet (sync with blockchain)
+// Refresh wallet
 app.post('/api/wallet/refresh', async (req, res) => {
     try {
         const data = await walletRpc('refresh');
@@ -505,7 +377,6 @@ app.post('/api/wallet/refresh', async (req, res) => {
 app.post('/api/wallet/close', async (req, res) => {
     try {
         await walletRpc('close_wallet');
-        currentWalletName = null;
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -516,21 +387,20 @@ app.post('/api/wallet/close', async (req, res) => {
 app.get('/api/wallet/status', async (req, res) => {
     try {
         const height = await walletRpc('get_height');
+        const address = await walletRpc('get_address');
         res.json({
-            open: currentWalletName !== null,
-            name: currentWalletName,
+            open: !!address.result?.address,
+            address: address.result?.address,
             height: height.result?.height
         });
     } catch (error) {
-        res.json({ open: false, name: null });
+        res.json({ open: false });
     }
 });
 
 // ==================== SERVER START ====================
 
-// Controller no longer needed - mining uses daemon RPC directly
-
-const server = app.listen(PORT, '127.0.0.1', async () => {
+const server = app.listen(PORT, '127.0.0.1', () => {
     console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║                                                           ║
@@ -541,23 +411,20 @@ const server = app.listen(PORT, '127.0.0.1', async () => {
 ║    ╚██████╗╚██████╔╝╚██████╗██║  ██║██║██║ ╚████║███████╗ ║
 ║     ╚═════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝ ║
 ║                                                           ║
-║                    DASHBOARD v2.0                         ║
+║                    DASHBOARD v2.1                         ║
 ║                                                           ║
 ╚═══════════════════════════════════════════════════════════╝
 
 Dashboard running at http://127.0.0.1:${PORT}
-Daemon RPC: port 19081
-Wallet RPC: port 19083
+
+Requirements:
+  - cocained must be running on port 19081
+  - cocaine-wallet-rpc on port 19083 (optional, for wallet features)
+
+Wallet directory: ${WALLET_DIR}
 
 Press Ctrl+C to stop
 `);
-
-    // Start wallet RPC
-    try {
-        await startWalletRpc();
-    } catch (e) {
-        console.log('[!] Wallet RPC failed to start:', e.message);
-    }
 
     // Auto-open browser
     setTimeout(() => {
@@ -573,14 +440,7 @@ server.on('error', (err) => {
     throw err;
 });
 
-// Cleanup on exit
 process.on('SIGINT', () => {
     console.log('\n[*] Shutting down...');
-    if (walletRpcProcess) {
-        walletRpcProcess.kill();
-    }
-    if (controllerProcess) {
-        controllerProcess.kill();
-    }
     process.exit(0);
 });

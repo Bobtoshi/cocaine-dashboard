@@ -1,7 +1,7 @@
 {
   "name": "cocaine-dashboard",
-  "version": "1.0.0",
-  "description": "Cocaine blockchain dashboard - run locally",
+  "version": "2.1.0",
+  "description": "Web dashboard for COCAINE (COCA) cryptocurrency",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -11,8 +11,7 @@
     "node-fetch": "^2.7.0",
     "open": "^8.4.2"
   },
-  "scripts": {
-    "start": "node server.js",
-    "controller": "node controller.js"
+  "engines": {
+    "node": ">=14.0.0"
   }
 }
