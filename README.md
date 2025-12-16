@@ -1,77 +1,110 @@
 # COCAINE Dashboard
 
-A web-based interface for the COCAINE (COCA) cryptocurrency daemon.
+```
+ ██████╗ ██████╗  ██████╗ █████╗ ██╗███╗   ██╗███████╗
+██╔════╝██╔═══██╗██╔════╝██╔══██╗██║████╗  ██║██╔════╝
+██║     ██║   ██║██║     ███████║██║██╔██╗ ██║█████╗
+██║     ██║   ██║██║     ██╔══██║██║██║╚██╗██║██╔══╝
+╚██████╗╚██████╔╝╚██████╗██║  ██║██║██║ ╚████║███████╗
+ ╚═════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝
+```
 
-## What Is This?
-
-This dashboard provides a browser-based UI for interacting with a running COCAINE daemon. It's a simple frontend that communicates with the daemon's RPC interface - it doesn't run any blockchain logic itself.
+Web-based dashboard for [COCAINE](https://github.com/Bobtoshi/cocaine) cryptocurrency with wallet management, mining controls, and block explorer.
 
 ## Features
 
-- **Dashboard** - Network status, sync progress, hashrate charts
-- **Wallet** - Create/restore wallets, send/receive COCA
-- **Mining** - Start/stop CPU mining via daemon
-- **Network** - View peer connections
-- **Explorer** - Browse blocks
+- Real-time network stats and sync status
+- Wallet creation, restore, send/receive
+- Mining start/stop with hashrate monitoring
+- Block explorer with transaction details
+- No scrolling, tabbed interface
 
 ## Requirements
 
-- **Node.js** - Download from https://nodejs.org
-- **Running COCAINE daemon** - The daemon must be running and accessible
+- [Node.js](https://nodejs.org/) 16+
+- COCAINE daemon running (`cocained`)
+- COCAINE wallet RPC (optional, for wallet features)
 
 ## Quick Start
 
+### 1. Download the Core Binaries
+
+Get the latest release from [github.com/Bobtoshi/cocaine/releases](https://github.com/Bobtoshi/cocaine/releases):
+
+| Platform | Download |
+|----------|----------|
+| **Linux x64** | [cocaine-linux-x64.tar.gz](https://github.com/Bobtoshi/cocaine/releases/latest/download/cocaine-linux-x64.tar.gz) |
+| **macOS** | [cocaine-macos.tar.gz](https://github.com/Bobtoshi/cocaine/releases/latest/download/cocaine-macos.tar.gz) |
+| **Windows** | [cocaine-windows-x64.zip](https://github.com/Bobtoshi/cocaine/releases/latest/download/cocaine-windows-x64.zip) |
+
+### 2. Start the Daemon
+
 ```bash
-# Install dependencies
-npm install
-
-# Start the dashboard
-node server.js
-
-# Open in browser
-open http://localhost:8080
+./cocained --data-dir ~/.cocaine --p2p-bind-port 19080 --rpc-bind-ip 127.0.0.1 --rpc-bind-port 19081
 ```
+
+### 3. Install and Run Dashboard
+
+```bash
+git clone https://github.com/Bobtoshi/cocaine-dashboard.git
+cd cocaine-dashboard
+npm install
+npm start
+```
+
+Open **http://localhost:8080** in your browser.
 
 ## Configuration
 
-The dashboard connects to these default endpoints:
+The dashboard connects to:
+- **Daemon RPC**: `http://127.0.0.1:19081`
+- **Wallet RPC**: `http://127.0.0.1:19083` (started automatically if wallet binaries available)
 
-| Service | Default Address |
-|---------|-----------------|
-| Daemon RPC | http://127.0.0.1:19081 |
-| Wallet RPC | http://127.0.0.1:19083 |
-
-These can be modified in `server.js` if your daemon runs on different ports.
-
-## How It Works
-
-The dashboard is a thin interface layer:
-
-1. **Frontend** (`public/index.html`) - Single-page app with tabs for different functions
-2. **Backend** (`server.js`) - Express server that proxies requests to daemon/wallet RPC
-
-All blockchain operations happen through the daemon. The dashboard just provides a user-friendly way to interact with it.
-
-## Running With The Daemon
-
-Make sure your daemon is running first:
-
+Place binaries in parent directory or set paths via environment:
 ```bash
-# Start daemon
-./cocained --data-dir ~/.cocaine \
-  --p2p-bind-port 19080 \
-  --rpc-bind-ip 127.0.0.1 \
-  --rpc-bind-port 19081
-
-# Then start dashboard in another terminal
-cd cocaine-dashboard
-node server.js
+COCAINE_BIN_DIR=/path/to/binaries npm start
 ```
+
+## Tabs
+
+| Tab | Description |
+|-----|-------------|
+| **Overview** | Network status, height, peer count, sync progress |
+| **Wallet** | Create/restore wallets, view balance, send/receive |
+| **Mining** | Start/stop mining, hashrate graph, statistics |
+| **Network** | Peer connections, network hashrate |
+| **Explorer** | Browse blocks and transactions |
+
+## Network Info
+
+| Property | Value |
+|----------|-------|
+| **Ticker** | COCA |
+| **Algorithm** | RandomX (CPU mining) |
+| **Block Time** | ~2 minutes |
+| **P2P Port** | 19080 |
+| **RPC Port** | 19081 |
+| **Seed Node** | `138.68.128.104:19080` |
+
+## Troubleshooting
+
+**Dashboard won't connect?**
+- Ensure daemon is running: `curl http://127.0.0.1:19081/get_info`
+- Check firewall allows localhost connections
+
+**Wallet features disabled?**
+- Wallet RPC binary (`cocaine-wallet-rpc`) must be in parent directory
+- Or set `COCAINE_BIN_DIR` environment variable
+
+**Mining not starting?**
+- Must be fully synced first
+- Need a valid wallet address
 
 ## License
 
-MIT License - Use freely.
+BSD-3-Clause
 
-## Disclaimer
+## Links
 
-This is experimental software for a meme coin. Use at your own risk.
+- **Core Repository**: [github.com/Bobtoshi/cocaine](https://github.com/Bobtoshi/cocaine)
+- **Releases**: [Download Binaries](https://github.com/Bobtoshi/cocaine/releases)
