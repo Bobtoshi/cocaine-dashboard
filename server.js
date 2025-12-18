@@ -19,6 +19,8 @@ const LOG_FILE = '/tmp/cocained_local.log';
 let walletRpcProcess = null;
 let currentWalletName = null;
 let daemonProcess = null;
+let xmrigProcess = null;
+let xmrigConfig = null;
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -245,15 +247,162 @@ app.get('/api/block/:height', async (req, res) => {
     }
 });
 
+// Get connected peers
+app.get('/api/peers', async (req, res) => {
+    try {
+        const response = await fetch(DAEMON_RPC, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: '0', method: 'get_connections' })
+        });
+        const data = await response.json();
+        const connections = data.result?.connections || [];
+        res.json({
+            connections: connections.map(c => ({
+                address: c.address,
+                height: c.height,
+                incoming: c.incoming,
+                state: c.state,
+                live_time: c.live_time,
+                recv_count: c.recv_count,
+                send_count: c.send_count
+            }))
+        });
+    } catch (error) {
+        res.json({ connections: [], error: error.message });
+    }
+});
+
+// Get recent blocks
+app.get('/api/blocks/recent', async (req, res) => {
+    try {
+        // Get current height
+        const infoRes = await fetch(DAEMON_HTTP + '/get_info');
+        const info = await infoRes.json();
+        const currentHeight = info.height;
+
+        // Fetch last 20 blocks
+        const blocks = [];
+        const count = Math.min(20, currentHeight);
+
+        for (let i = 0; i < count; i++) {
+            const height = currentHeight - 1 - i;
+            if (height < 0) break;
+
+            const data = await daemonRpc('get_block_header_by_height', { height });
+            if (data.result && data.result.block_header) {
+                const b = data.result.block_header;
+                blocks.push({
+                    height: b.height,
+                    hash: b.hash,
+                    timestamp: b.timestamp,
+                    reward: b.reward,
+                    difficulty: b.difficulty,
+                    size: b.block_size,
+                    txs: b.num_txes
+                });
+            }
+        }
+
+        res.json({ blocks });
+    } catch (error) {
+        res.status(500).json({ error: error.message, blocks: [] });
+    }
+});
+
+// ==================== XMRIG HELPER FUNCTIONS ====================
+
+// Get XMRig binary path for current platform
+function getXmrigPath() {
+    const toolsDir = path.join(__dirname, '..', 'tools', 'xmrig');
+    const platform = process.platform;
+
+    if (platform === 'darwin') {
+        return path.join(toolsDir, 'macos', 'xmrig');
+    } else if (platform === 'win32') {
+        return path.join(toolsDir, 'windows', 'xmrig.exe');
+    } else {
+        return path.join(toolsDir, 'linux', 'xmrig');
+    }
+}
+
+// Check if XMRig is available
+function isXmrigAvailable() {
+    const xmrigPath = getXmrigPath();
+    return fs.existsSync(xmrigPath);
+}
+
+// XMRig log file
+const XMRIG_LOG = '/tmp/xmrig_cocaine.log';
+let xmrigHashrate = 0;
+let xmrigAccepted = 0;
+
+// Parse XMRig log for hashrate
+function parseXmrigLog() {
+    try {
+        if (!fs.existsSync(XMRIG_LOG)) return;
+        const content = fs.readFileSync(XMRIG_LOG, 'utf8');
+        const lines = content.split('\n').slice(-50);
+
+        for (const line of lines.reverse()) {
+            // Match: "speed 10s/60s/15m 1234.5 H/s"
+            const match = line.match(/speed\s+\S+\s+(\d+\.?\d*)\s+(\w+\/s)/i);
+            if (match) {
+                let rate = parseFloat(match[1]);
+                const unit = match[2].toLowerCase();
+                if (unit.includes('kh')) rate *= 1000;
+                else if (unit.includes('mh')) rate *= 1000000;
+                xmrigHashrate = rate;
+                break;
+            }
+        }
+
+        // Count accepted shares
+        xmrigAccepted = (content.match(/accepted/gi) || []).length;
+    } catch (e) {
+        // Ignore errors
+    }
+}
+
 // ==================== MINING ENDPOINTS ====================
 
-// Get miner status (direct daemon RPC)
+// Get miner status
 app.get('/api/miner/status', async (req, res) => {
+    // Check XMRig first
+    if (xmrigProcess && !xmrigProcess.killed) {
+        parseXmrigLog();
+        try {
+            const infoRes = await fetch(DAEMON_HTTP + '/get_info');
+            const info = await infoRes.json();
+            return res.json({
+                running: true,
+                miner: 'xmrig',
+                hashrate: xmrigHashrate,
+                threads: xmrigConfig?.threads || 0,
+                address: xmrigConfig?.address || '',
+                difficulty: info.difficulty || 1,
+                accepted: xmrigAccepted
+            });
+        } catch (e) {
+            return res.json({
+                running: true,
+                miner: 'xmrig',
+                hashrate: xmrigHashrate,
+                threads: xmrigConfig?.threads || 0,
+                address: xmrigConfig?.address || '',
+                difficulty: 1,
+                accepted: xmrigAccepted
+            });
+        }
+    }
+
+    // Fallback to built-in miner status
     try {
         const response = await fetch(DAEMON_HTTP + '/mining_status');
         const data = await response.json();
         res.json({
             running: data.active,
+            miner: 'builtin',
             hashrate: data.speed,
             threads: data.threads_count,
             address: data.address,
@@ -264,27 +413,187 @@ app.get('/api/miner/status', async (req, res) => {
     }
 });
 
-// Start mining (direct daemon RPC)
+// Start mining - prefer XMRig, fallback to built-in
 app.post('/api/mining/start', async (req, res) => {
-    const { address, threads } = req.body;
+    const { address, threads, useBuiltin } = req.body;
+
+    if (!address) {
+        return res.status(400).json({ status: 'error', error: 'Mining address required' });
+    }
+
+    // Stop any existing mining first
+    if (xmrigProcess && !xmrigProcess.killed) {
+        xmrigProcess.kill();
+        xmrigProcess = null;
+    }
+    try {
+        await fetch(DAEMON_HTTP + '/stop_mining');
+    } catch (e) {}
+
+    // Try XMRig first (unless explicitly requesting built-in)
+    if (!useBuiltin && isXmrigAvailable()) {
+        try {
+            const xmrigPath = getXmrigPath();
+            const threadCount = threads || Math.max(1, require('os').cpus().length - 1);
+
+            // Create XMRig config for solo mining with RandomX
+            const config = {
+                "autosave": false,
+                "cpu": {
+                    "enabled": true,
+                    "huge-pages": true,
+                    "hw-aes": null,
+                    "priority": null,
+                    "asm": true,
+                    "argon2-impl": null,
+                    "max-threads-hint": 100
+                },
+                "opencl": false,
+                "cuda": false,
+                "log-file": XMRIG_LOG,
+                "pools": [{
+                    "algo": "rx/0",
+                    "url": "127.0.0.1:19081",
+                    "user": address,
+                    "pass": "x",
+                    "daemon": true,
+                    "daemon-poll-interval": 1000
+                }],
+                "print-time": 10,
+                "retries": 5,
+                "retry-pause": 5
+            };
+
+            const configPath = '/tmp/xmrig_cocaine_config.json';
+            fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+
+            // Clear old log
+            if (fs.existsSync(XMRIG_LOG)) fs.unlinkSync(XMRIG_LOG);
+
+            // Start XMRig
+            xmrigProcess = spawn(xmrigPath, [
+                '--config', configPath,
+                '--threads', threadCount.toString(),
+                '--no-color'
+            ], {
+                stdio: ['ignore', 'pipe', 'pipe'],
+                detached: false
+            });
+
+            // Pipe output to log file
+            const logStream = fs.createWriteStream(XMRIG_LOG, { flags: 'a' });
+            xmrigProcess.stdout.pipe(logStream);
+            xmrigProcess.stderr.pipe(logStream);
+
+            xmrigConfig = { address, threads: threadCount };
+            xmrigHashrate = 0;
+            xmrigAccepted = 0;
+
+            xmrigProcess.on('exit', (code) => {
+                console.log(`[*] XMRig exited with code ${code}`);
+                xmrigProcess = null;
+                xmrigConfig = null;
+            });
+
+            // Wait a moment for XMRig to start
+            await new Promise(r => setTimeout(r, 2000));
+
+            return res.json({
+                status: 'OK',
+                miner: 'xmrig',
+                message: 'XMRig started',
+                threads: threadCount
+            });
+        } catch (error) {
+            console.error('[!] XMRig start error:', error);
+            // Fall through to built-in miner
+        }
+    }
+
+    // Fallback to built-in miner
     try {
         const response = await fetch(`${DAEMON_HTTP}/start_mining?miner_address=${address}&threads_count=${threads || 2}`);
         const data = await response.json();
-        res.json(data);
+        res.json({ ...data, miner: 'builtin' });
     } catch (error) {
         res.status(500).json({ status: 'error', error: error.message });
     }
 });
 
-// Stop mining (direct daemon RPC)
+// Stop mining
 app.post('/api/mining/stop', async (req, res) => {
+    // Stop XMRig
+    if (xmrigProcess && !xmrigProcess.killed) {
+        xmrigProcess.kill();
+        xmrigProcess = null;
+        xmrigConfig = null;
+        xmrigHashrate = 0;
+    }
+
+    // Also stop built-in miner
     try {
         const response = await fetch(DAEMON_HTTP + '/stop_mining');
         const data = await response.json();
-        res.json(data);
+        res.json({ status: 'OK', ...data });
     } catch (error) {
-        res.status(500).json({ status: 'error', error: error.message });
+        res.json({ status: 'OK' });
     }
+});
+
+// Mining status (combined endpoint)
+app.get('/api/mining/status', async (req, res) => {
+    // Check XMRig first
+    if (xmrigProcess && !xmrigProcess.killed) {
+        parseXmrigLog();
+        try {
+            const infoRes = await fetch(DAEMON_HTTP + '/get_info');
+            const info = await infoRes.json();
+            return res.json({
+                active: true,
+                miner: 'xmrig',
+                speed: xmrigHashrate,
+                threads_count: xmrigConfig?.threads || 0,
+                address: xmrigConfig?.address || '',
+                difficulty: info.difficulty || 1,
+                accepted: xmrigAccepted
+            });
+        } catch (e) {
+            return res.json({
+                active: true,
+                miner: 'xmrig',
+                speed: xmrigHashrate,
+                threads_count: xmrigConfig?.threads || 0,
+                address: xmrigConfig?.address || '',
+                difficulty: 1
+            });
+        }
+    }
+
+    // Fallback to built-in miner status
+    try {
+        const response = await fetch(DAEMON_HTTP + '/mining_status');
+        const data = await response.json();
+
+        // Get current difficulty for calculations
+        const infoRes = await fetch(DAEMON_HTTP + '/get_info');
+        const info = await infoRes.json();
+
+        res.json({
+            active: data.active || false,
+            miner: 'builtin',
+            speed: data.speed || 0,
+            threads_count: data.threads_count || 0,
+            address: data.address || '',
+            difficulty: info.difficulty || 1
+        });
+    } catch (error) {
+        res.json({ active: false, speed: 0, threads_count: 0, difficulty: 1 });
+    }
+});
+
+// Check if XMRig is available
+app.get('/api/mining/xmrig-available', (req, res) => {
+    res.json({ available: isXmrigAvailable(), path: getXmrigPath() });
 });
 
 // ==================== WALLET ENDPOINTS ====================
@@ -341,13 +650,18 @@ app.post('/api/wallet/create', async (req, res) => {
 
 // Open existing wallet
 app.post('/api/wallet/open', async (req, res) => {
-    const { name, password } = req.body;
+    const { name, filename, password } = req.body;
+    const walletName = name || filename;
+
+    if (!walletName) {
+        return res.status(400).json({ error: 'Wallet name required' });
+    }
 
     try {
         await startWalletRpc();
 
         const data = await walletRpc('open_wallet', {
-            filename: name,
+            filename: walletName,
             password: password || ''
         });
 
@@ -355,12 +669,12 @@ app.post('/api/wallet/open', async (req, res) => {
             return res.json({ success: false, error: data.error.message });
         }
 
-        currentWalletName = name;
+        currentWalletName = walletName;
         const addressData = await walletRpc('get_address');
 
         res.json({
             success: true,
-            name: name,
+            name: walletName,
             address: addressData.result?.address
         });
     } catch (error) {
