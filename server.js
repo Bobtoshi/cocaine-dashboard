@@ -790,7 +790,7 @@ app.post('/api/wallet/send', async (req, res) => {
         const params = {
             destinations: [{ address: address, amount: atomicAmount }],
             priority: 1,
-            ring_size: 16,
+            ring_size: 11,
             get_tx_key: true
         };
 
